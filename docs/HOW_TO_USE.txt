@@ -1,0 +1,200 @@
+GOTOP 1060 PLUS (T501) + OPENTABLETDRIVER 0.6.x - WINDOWS 11
+VID 08F2 / PID 6811 (decimal 2290 / 26641)
+
+==============================================================================
+1. DAILY USAGE
+==============================================================================
+Each time you plug in the tablet (or unplug/replug, restart computer):
+  1. Plug it into the EXACT USB port where the device was disabled (see 2.B).
+  2. Double-click C:\gotop-tools\gotop_unlock.bat -> you must see "Unlock command sent: OK".
+  3. Open OpenTabletDriver, adjust the area in the Output tab.
+Without running the unlock, the tablet will only recognize a small active area.
+
+==============================================================================
+2. CLEAN INSTALLATION GUIDE
+==============================================================================
+Prerequisites: Windows 11, OTD 0.6.x installed, manufacturer's driver not installed.
+If Windows blocks scripts/DLLs: turn off Smart App Control (Windows Security >
+App & browser control).
+
+A. Create C:\gotop-tools, copy gotop_unlock.ps1 + gotop_unlock.bat into it (contents
+   in section 3). Plug in the tablet, run gotop_unlock.bat -> you must see "OK".
+
+B. Disable the digitizer in Device Manager:
+   - Human Interface Devices > each "HID-compliant ..." item > Properties >
+     Details > Hardware IDs.
+   - For the item with VID_08F2&PID_6811 AND HID_DEVICE_UP:000D (belonging to MI_02)
+     -> right-click > Disable device.
+   - DO NOT disable the item with HID_DEVICE_UP:FFA0 (required by the script and OTD).
+   - If the cursor still moves automatically when OTD is closed: also disable the mouse collection (UP:0001, MI_01).
+   - Disabling is tied to the USB port: switching ports requires disabling again.
+
+C. Install the parser plugin (requires .NET SDK, internet connection to download NuGet):
+   - Create C:\gotop-plugin, copy GotopT501.csproj + GotopT501ReportParser.cs into it.
+   - cd C:\gotop-plugin
+     dotnet build -c Release
+   - Copy ONLY bin\Release\net8.0\GotopT501.dll to
+     %localappdata%\OpenTabletDriver\Plugins\GotopT501\  (create the folder if it doesn't exist)
+   - If missing namespace OpenTabletDriver.Plugin.Tablet -> change "using" to
+     OpenTabletDriver.Tablet. If OTD runs on .NET 6 -> change TargetFramework to net6.0.
+
+D. Copy Gotop_1060_Plus_T501_D_plugin.json to
+   %localappdata%\OpenTabletDriver\Configurations\
+   Keep ONLY ONE Gotop configuration file in this folder (delete old/duplicate versions).
+
+E. Completely exit OTD (including the daemon in Task Manager), then reopen it.
+
+==============================================================================
+3. FILE CONTENTS
+==============================================================================
+
+----- gotop_unlock.bat -----
+@echo off
+powershell -ExecutionPolicy Bypass -File "%~dp0gotop_unlock.ps1"
+pause
+
+----- gotop_unlock.ps1 -----
+# Gotop T501 (08F2:6811) - unlock the full active area by sending command 3 only.
+# Run after plugging in the tablet. Waits up to 60 seconds for the device to appear.
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class HidNative3 {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+    [DllImport("hid.dll", SetLastError = true)]
+    static extern bool HidD_SetFeature(SafeFileHandle h, byte[] buf, int len);
+
+    public static SafeFileHandle Open(string path, out int err) {
+        SafeFileHandle h = CreateFile(path, 0xC0000000u, 3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+        err = h.IsInvalid ? Marshal.GetLastWin32Error() : 0;
+        return h;
+    }
+    public static int SetFeature(SafeFileHandle h, byte[] buf) {
+        return HidD_SetFeature(h, buf, buf.Length) ? 0 : Marshal.GetLastWin32Error();
+    }
+}
+"@
+
+$cmd = [byte[]](0x08, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00)
+$deadline = (Get-Date).AddSeconds(60)
+$done = $false
+
+while (-not $done -and (Get-Date) -lt $deadline) {
+    $devs = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object { $_.InstanceId -like 'HID\VID_08F2&PID_6811&MI_02&COL01*' }
+    foreach ($d in $devs) {
+        $path = '\\?\' + $d.InstanceId.Replace('\', '#') + '#{4d1e55b2-f16f-11cf-88cb-001111000030}'
+        $err = 0
+        $h = [HidNative3]::Open($path, [ref]$err)
+        if ($err -ne 0) { continue }
+        $e = [HidNative3]::SetFeature($h, $cmd)
+        $h.Close()
+        if ($e -eq 0) { Write-Host "Unlock command sent: OK"; $done = $true; break }
+        else { Write-Host "SetFeature failed, Win32 error $e (will retry)" }
+    }
+    if (-not $done) { Start-Sleep -Seconds 1 }
+}
+
+if (-not $done) { Write-Host "Tablet not found or command failed after 60 seconds."; exit 1 }
+
+----- GotopT501.csproj -----
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>GotopT501</AssemblyName>
+    <RootNamespace>GotopT501</RootNamespace>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTabletDriver.Plugin" Version="0.6.7" />
+  </ItemGroup>
+
+</Project>
+
+----- GotopT501ReportParser.cs -----
+using OpenTabletDriver.Plugin.Tablet;
+
+namespace GotopT501
+{
+    // Parser for the Gotop T501 tablet (08F2:6811), vendor interface input report ID 1.
+    // Layout (8 bytes), same as the standard digitizer report ID 5:
+    //   [0] report ID
+    //   [1] flags: bit0 = tip, bit1 = barrel button, bit2 = second button, bit6 = in range
+    //   [2..3] X (little-endian)
+    //   [4..5] Y (little-endian)
+    //   [6..7] pressure (little-endian, 0..2047)
+    // Observed states: 0xC0 = hovering, 0xC1 = touching, 0x80 = out of range.
+    public class GotopT501ReportParser : IReportParser<IDeviceReport>
+    {
+        public IDeviceReport Parse(byte[] report)
+        {
+            if (report.Length < 8)
+                return new OutOfRangeReport(report);
+
+            bool inRange = (report[1] & 0x40) != 0;
+            if (!inRange)
+                return new OutOfRangeReport(report);
+
+            return new TabletReport(report);
+        }
+    }
+}
+
+----- Gotop_1060_Plus_T501_D_plugin.json -----
+{
+  "Name": "Gotop 1060 Plus (T501)",
+  "Specifications": {
+    "Digitizer": {
+      "Width": 254,
+      "Height": 158.75,
+      "MaxX": 4096,
+      "MaxY": 4096
+    },
+    "Pen": {
+      "MaxPressure": 2047,
+      "ButtonCount": 2
+    },
+    "AuxiliaryButtons": null,
+    "MouseButtons": null,
+    "Touch": null
+  },
+  "DigitizerIdentifiers": [
+    {
+      "VendorID": 2290,
+      "ProductID": 26641,
+      "InputReportLength": 8,
+      "OutputReportLength": 9,
+      "ReportParser": "GotopT501.GotopT501ReportParser",
+      "FeatureInitReport": null,
+      "OutputInitReport": null,
+      "DeviceStrings": {},
+      "InitializationStrings": []
+    }
+  ],
+  "AuxilaryDeviceIdentifiers": [],
+  "Attributes": {}
+}
+
+==============================================================================
+4. QUICK TROUBLESHOOTING & VERIFICATION
+==============================================================================
+Verification: OTD > Tools > Tablet Debugger. Success when X runs from 0 -> ~4032+, Y from 0 -> 4095, hovering pen does not report "out of range", max pressure is 2047.
+
+- "No tablets were detected"   -> missing/duplicate/malformed JSON file, or missing
+                                  Plugins\GotopT501 folder (check Console tab).
+- Only recognizes small area   -> did not run gotop_unlock.bat after plugging in.
+- Pen is "frozen"              -> unplug/replug, re-run unlock. DO NOT send command
+                                  08 03 00 ff f0 00 ff f0.
+- Cursor covers full area despite adjustments -> digitizer not disabled, or USB port changed.
+- Hover not working            -> GotopT501.dll not loaded or JSON has wrong parser.
+- Script cannot find device    -> check Hardware IDs of MI_02 COL01.
+- Script Win32 error           -> unplug tablet, close OTD/manufacturer driver, re-run.
+
+Revert: Re-enable disabled devices and use the manufacturer driver inside the virtual CD drive
+"Driver Inside Tablet".

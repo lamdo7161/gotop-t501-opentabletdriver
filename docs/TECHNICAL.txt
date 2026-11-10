@@ -1,0 +1,323 @@
+==============================================================================
+  GOTOP 1060 PLUS (T501) + OPENTABLETDRIVER  -  TECHNICAL DOCUMENTATION
+==============================================================================
+
+Tablet        : Gotop 1060 Plus, device name "[T501] Driver Inside Tablet"
+Hardware ID   : VID 08F2 / PID 6811  (decimal: 2290 / 26641)
+OS            : Windows 11
+OTD           : OpenTabletDriver 0.6.x
+
+
+------------------------------------------------------------------------------
+ 1. HID ARCHITECTURE
+------------------------------------------------------------------------------
+
+The tablet exposes itself to the operating system as a composite device with 3 interfaces
+(according to the captured HID descriptor):
+
+  Interface 0
+    - Virtual CD drive "Driver Inside Tablet" (contains the manufacturer's driver).
+    - Does not participate in pen data transmission.
+
+  Interface 1 (MI_01)
+    - Vendor collection, Usage Page FFA0: report ID 6, 64 bytes.
+    - Mouse collection (Usage Page 0001): report ID 3.
+
+  Interface 2 (MI_02)
+    - Vendor collection, Usage Page FFA0: Input report ID 1 (pen data) and
+      Feature report ID 8 (control command channel).
+    - Keyboard collection: report ID 2.
+    - Digitizer collection, Usage Page 000D: report ID 5 (standard pen data).
+    - Pen collection: report ID 7.
+    - Consumer/media collection: report ID 4.
+
+Main functions of each group:
+
+  Digitizer (UP 000D, ID 5)
+    Standard Windows pen interface. Windows automatically detects and uses it to control
+    the cursor. Pen data is identical to the vendor interface.
+
+  Vendor (UP FFA0, MI_02 COL01)
+    - Input report ID 1: transmits the same 8-byte pen data packet as the digitizer.
+    - Feature report ID 8: receives configuration commands (unlocks the active area).
+    - This is the interface from which OTD reads data and the script sends commands.
+
+  Remaining collections (mouse, keyboard, consumer, pen ID 7, vendor MI_01)
+    Not used in the current configuration.
+
+Interface identification in Windows:
+    HID\VID_08F2&PID_6811&MI_02&COL01   ->  vendor interface (FFA0)
+    Hardware ID containing HID_DEVICE_UP:000D ->  digitizer
+    Hardware ID containing HID_DEVICE_UP:FFA0 ->  vendor
+    Hardware ID containing HID_DEVICE_UP:0001 ->  mouse (MI_01)
+
+
+------------------------------------------------------------------------------
+ 2. ACTIVE AREA UNLOCK MECHANISM
+------------------------------------------------------------------------------
+
+Phenomenon: without the initialization command, the tablet only reports coordinates within a small
+region (measured approximately X 0-2925, Y 441-3923). After unlocking, the entire active
+area is reported (X 0 to approx. 4032, Y 0 to 4095).
+
+Command channel: Feature report ID 8, 8 bytes long, sent via SET_REPORT (in
+Windows, HidD_SetFeature) to the vendor interface MI_02&COL01.
+
+The manufacturer's driver sends 3 commands when the tablet is plugged in (captured via Wireshark +
+USBPcap), spaced about 0.3 seconds apart:
+
+    1) 08 04 1d 01 00 00 06 59
+         No visible effect on the active area.
+
+    2) 08 03 00 ff f0 00 ff f0      (sent twice by the manufacturer's driver)
+         When sent alone, the tablet stops sending data to OTD (pen freezes).
+         => DO NOT use.
+
+    3) 08 06 01 00 00 00 00 00
+         Unlocks the entire active area.
+         => USE this command only.
+
+Reason for using only the third command:
+    - Command 3 is the only one with a verifiable effect on the area.
+    - Command 2 causes a loss of the data stream to OTD.
+    - Command 1 has no observable effect, so it is ignored.
+
+Characteristics of the unlocked state:
+    - Not persistent after unplugging/replugging the tablet; the command must be resent every time
+    the tablet is powered on / re-enumerated.
+    - The command must be sent to the vendor interface (MI_02&COL01). Sending it to the digitizer interface has no effect.
+
+Method for sending commands (summarized from the script):
+    - Open a handle to the HID device path formatted as
+        \\?\HID#VID_08F2&PID_6811&MI_02&COL01#...#{4d1e55b2-f16f-11cf-88cb-001111000030}
+      using CreateFile (read/write access, share mode 3, OPEN_EXISTING).
+    - Call HidD_SetFeature with an 8-byte buffer: 08 06 01 00 00 00 00 00.
+    - Implement a retry loop waiting for the device to appear (up to 60 seconds) and handle errors.
+
+
+------------------------------------------------------------------------------
+ 3. WINDOWS - OTD COORDINATION MECHANISM
+------------------------------------------------------------------------------
+
+Conflict issue:
+    Windows recognizes the digitizer interface (UP 000D) as a standard pen device and automatically
+    controls the cursor over the full area. In this case, even if OTD adjusts the area, it has no
+    effect because the cursor is controlled by Windows.
+
+Roles allocation:
+    - Digitizer (UP 000D, MI_02): Disabled in Device Manager so Windows no longer reads pen data and does not drive the cursor.
+    - Vendor (UP FFA0, MI_02 COL01): NOT disabled. OTD reads pen data from here, and its Feature report ID 8 channel is used to send unlock commands.
+    - OTD: The sole handler of pen data and cursor control, ensuring OTD's area, mapping, and Pen Settings take effect.
+
+Avoiding cursor control conflicts:
+    - Pen data appears in two interfaces (digitizer ID 5 and vendor ID 1) with identical content. Only allowing one side (vendor -> OTD) to function prevents two sources from driving the cursor simultaneously.
+    - If the cursor still moves automatically when OTD is turned off, check the mouse collection (UP 0001) under MI_01.
+
+Why the JSON configuration does not use FeatureInitReport:
+    OTD sends the init report to the wrong interface (digitizer instead of vendor), so the command has no effect. Therefore, unlocking is handled externally outside OTD.
+
+Constraints:
+    - Device disabling is tied to the USB port (via the device path). Plugging it into a different port causes Windows to treat it as a new device, re-enabling the digitizer and bringing back conflicts.
+
+
+------------------------------------------------------------------------------
+ 4. PEN DATA FORMAT
+------------------------------------------------------------------------------
+
+8-byte data packet, identical in report ID 5 (digitizer) and ID 1 (vendor):
+
+    Byte   Content
+    [0]    Report ID (1 or 5)
+    [1]    Status flags
+    [2-3]  X, little-endian
+    [4-5]  Y, little-endian
+    [6-7]  Pressure, little-endian, 0..2047
+
+Flag byte [1]:
+    bit 0 = tip touch (tip)
+    bit 1 = barrel button
+    bit 2 = secondary button
+    bit 3 = invert
+    bit 6 = pen in range
+
+Observed flag values:
+    0xC0 = pen hovering in range (hover)      bit 6 = 1, bit 0 = 0
+    0xC1 = pen touching (touch)               bit 6 = 1, bit 0 = 1
+    0x80 = pen out of range                   bit 6 = 0
+
+Coordinates:
+    - Measured values when unlocked: Max X ~4032, Max Y ~4095, Min 0.
+    - HID descriptor declares 4096 x 4096.
+
+Pressure:
+    - 16-bit little-endian, measured max 2047.
+
+Physical dimensions:
+    - HID descriptor declares 8 x 5.34 inches, but actual physical size is
+      10 x 6.25 inches (254 x 158.75 mm).
+
+
+------------------------------------------------------------------------------
+ 5. GotopT501 PLUGIN
+------------------------------------------------------------------------------
+
+Class name: GotopT501.GotopT501ReportParser
+Interface: IReportParser<IDeviceReport> (OpenTabletDriver.Plugin 0.6.7,
+           target net8.0).
+
+Why a plugin is needed:
+    OTD's built-in "XP_Pen" parser treats packets with flag byte = 0xC0 as "pen out of range". On this tablet, 0xC0 actually means "pen is hovering in range". Consequence of using the XP_Pen parser: hover state is lost, and the pen only works when touching.
+
+Parser logic:
+
+    Parse(report):
+        if report length < 8      -> return OutOfRangeReport
+        inRange = (report[1] & 0x40) != 0      // bit 6 of the flag byte
+        if not inRange          -> return OutOfRangeReport
+        else                    -> return TabletReport(report)
+
+Interpretation of states:
+    - Rely solely on bit 6 to determine whether the pen is in range, instead of comparing the flag byte value to 0xC0.
+    - Hover (0xC0): bit 6 on, bit 0 off -> TabletReport with 0 pressure, cursor moves without clicking.
+    - Touch (0xC1): bit 6 on, bit 0 on -> TabletReport with pressure > 0, counted as a touch.
+    - Out of range (0x80): bit 6 off -> OutOfRangeReport.
+    - TabletReport decodes X, Y, pressure, and buttons from the 8-byte packet according to the structure in Section 4.
+
+
+------------------------------------------------------------------------------
+ 6. JSON CONFIGURATION
+------------------------------------------------------------------------------
+
+File: Gotop_1060_Plus_T501_D_plugin.json (placed in OTD's Configurations folder; only one configuration file should exist for this tablet to avoid identification conflicts).
+
+Abbreviated configuration:
+
+    {
+      "Name": "Gotop 1060 Plus (T501)",
+      "Specifications": {
+        "Digitizer": { "Width": 254, "Height": 158.75,
+                       "MaxX": 4096, "MaxY": 4096 },
+        "Pen": { "MaxPressure": 2047, "ButtonCount": 2 },
+        "AuxiliaryButtons": null,
+        "MouseButtons": null,
+        "Touch": null
+      },
+      "DigitizerIdentifiers": [
+        {
+          "VendorID": 2290,
+          "ProductID": 26641,
+          "InputReportLength": 8,
+          "OutputReportLength": 9,
+          "ReportParser": "GotopT501.GotopT501ReportParser",
+          "FeatureInitReport": null,
+          "OutputInitReport": null,
+          "DeviceStrings": {},
+          "InitializationStrings": []
+        }
+      ],
+      "AuxilaryDeviceIdentifiers": [],
+      "Attributes": {}
+    }
+
+Significance of important fields:
+
+    VendorID 2290 / ProductID 26641
+        = 08F2:6811 (decimal format). Used by OTD to recognize the device.
+
+    InputReportLength 8 / OutputReportLength 9
+        Used by OTD to select the correct vendor interface (MI_02&COL01), as this is the interface with matching report lengths. The digitizer interface is disabled so it won't be mistakenly selected.
+
+    ReportParser = GotopT501.GotopT501ReportParser
+        Instructs OTD to use the parser in the plugin (Section 5) instead of the XP_Pen parser.
+
+    MaxX / MaxY = 4096
+        Maximum coordinate range of the digitizer, used to map raw coordinates to workspace positions.
+
+    MaxPressure = 2047
+        Maximum pressure value (11-bit).
+
+    Width 254 / Height 158.75 (mm)
+        Nominal active area size 10 x 6.25 inches. Used to calculate aspect ratio and mapping.
+
+    ButtonCount = 2
+        Number of barrel buttons.
+
+    FeatureInitReport / OutputInitReport = null
+        Prevents OTD from sending initialization commands; the unlock command is sent externally to the correct vendor interface (see Sections 2 and 3).
+
+    AuxiliaryButtons / MouseButtons / Touch = null
+        Tablet express keys, mouse, and touch features are unconfigured.
+
+
+------------------------------------------------------------------------------
+ 7. OVERALL WORKFLOW
+------------------------------------------------------------------------------
+
+  1) Tablet is powered on and enumerated:
+        Windows creates HID devices for MI_01 and MI_02 (vendor FFA0,
+        digitizer 000D, etc.). In this state, the tablet reports only a small area.
+
+  2) Send unlock command:
+        Feature report ID 8 = 08 06 01 00 00 00 00 00 sent to the vendor
+        interface MI_02&COL01. The tablet switches to reporting the full active area.
+
+  3) Windows does not drive the cursor:
+        The digitizer interface (UP 000D) is disabled, so Windows does not process pen data.
+
+  4) Pen moves on the tablet:
+        The tablet sends an 8-byte packet (report ID 1) via the vendor interface.
+
+  5) OTD reads and analyzes:
+        OTD receives the packet according to the JSON file (VID/PID, report length) and passes it to GotopT501ReportParser.
+            bit 6 off -> OutOfRangeReport
+            bit 6 on  -> TabletReport (hover if bit 0 off, touch if bit 0 on)
+
+  6) OTD controls the cursor:
+        Using X, Y, pressure, and buttons, OTD applies area, mapping, and Pen
+        Settings to output the system cursor. This is the sole source controlling the cursor.
+
+  Diagram:
+
+    Tablet --(Feature ID 8: unlock command)--> vendor interface (MI_02 COL01)
+    Tablet --(Input ID 1: 8-byte packet)------> vendor interface --> OTD
+    OTD: JSON (recognition) -> GotopT501ReportParser -> area/mapping -> cursor
+    Digitizer interface (UP 000D): Disabled, Windows does not participate.
+
+
+------------------------------------------------------------------------------
+ 8. TECHNICAL PARAMETERS AND LIMITATIONS
+------------------------------------------------------------------------------
+
+A. Verified
+
+    - Identification: VID 08F2, PID 6811.
+    - 8-byte pen packet structure and field positions (Section 4).
+    - Flag values: 0xC0 = hover, 0xC1 = touch, 0x80 = out of range.
+    - Unlocked state: X approx. 0-2925, Y approx. 441-3923.
+    - After unlocking: Max X ~4032, Max Y ~4095.
+    - Max pressure: 2047.
+    - Report rate: approx. 230-260 Hz.
+    - Command 08 06 01 00 00 00 00 00 unlocks the full area.
+    - Command 08 03 00 ff f0 00 ff f0 causes the tablet to stop sending data to OTD.
+    - XP_Pen parser breaks hover; GotopT501 parser displays hover correctly
+      (no longer reports "Pen is out of Range" when hovering).
+    - Sending the unlock command to the vendor interface works; sending via OTD
+      FeatureInitReport (to the digitizer interface) does not work.
+    - Unlock state is not preserved after unplugging/replugging the tablet.
+
+B. Unverified / Limitations
+
+    - Exact meaning of the 3 initialization commands: effects are known through testing, but the function of each individual byte remains unclear.
+    - Actual MaxX might be 4032 (measured max X 4032, max Y 4095), while JSON sets 4096 for both axes. If the cursor does not reach the far right edge, re-measure max X and adjust MaxX.
+    - Width/Height in JSON are nominal dimensions, not measured with a ruler.
+      (HID descriptor declares 8 x 5.34 inches, differing from the actual 10 x 6.25 inches size.)
+    - Tablet hardware buttons are not configured (AuxiliaryButtons = null).
+    - Functions of individual barrel buttons (bit 1, bit 2) have not been individually tested.
+    - Meaning of bit 3 (invert) and the actual role of pen collection ID 7 are unverified.
+    - "Out of range" issue when pressing the pen too hard (previously encountered with the XP_Pen parser) has not been re-confirmed with the new plugin.
+    - It is undetermined whether command 1 has any effect other than on the active area.
+    - No method exists to preserve the unlock state across unplug/replug cycles other than resending the command.
+
+==============================================================================
+ END
+==============================================================================

@@ -1,0 +1,33 @@
+{
+  "Name": "Gotop 1060 Plus (T501)",
+  "Specifications": {
+    "Digitizer": {
+      "Width": 254,
+      "Height": 158.75,
+      "MaxX": 4096,
+      "MaxY": 4096
+    },
+    "Pen": {
+      "MaxPressure": 2047,
+      "ButtonCount": 2
+    },
+    "AuxiliaryButtons": null,
+    "MouseButtons": null,
+    "Touch": null
+  },
+  "DigitizerIdentifiers": [
+    {
+      "VendorID": 2290,
+      "ProductID": 26641,
+      "InputReportLength": 8,
+      "OutputReportLength": 9,
+      "ReportParser": "GotopT501.GotopT501ReportParser",
+      "FeatureInitReport": null,
+      "OutputInitReport": null,
+      "DeviceStrings": {},
+      "InitializationStrings": []
+    }
+  ],
+  "AuxilaryDeviceIdentifiers": [],
+  "Attributes": {}
+}
